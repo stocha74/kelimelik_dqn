@@ -35,8 +35,15 @@ def encode_board(board):
     for y in range(15):
         for x in range(15):
             cell = board[y][x]
-            if cell in HARF2ID:
-                tensor[y, x, HARF2ID[cell]] = 1.0
+            if not cell:
+                continue
+            # Joker hücreleri küçük harf olarak saklanır; büyük harfe çevir
+            upper = cell.upper()
+            if upper in HARF2ID:
+                tensor[y, x, HARF2ID[upper]] = 1.0
+                # Joker olduğunu '*' kanalında da işaretle
+                if cell != upper:
+                    tensor[y, x, HARF2ID['*']] = 1.0
     return tensor
 
 def encode_raf(raf):
@@ -77,12 +84,33 @@ class KelimelikDQNEnv(gym.Env):
         self.reset()
 
     def reset(self, seed=None, options=None):
+        import random as _random
         # Boş tahta
         self.board = np.array([["" for _ in range(15)] for _ in range(15)])
-        # Orta kısımda A L T A Y örnek olarak duruyor
-        self.board[7][7:12] = list("ALTAY")
+
+        # ALTAY'ı her episode'da (7,7)'den geçen rastgele bir konuma yerleştir
+        # Yatay: satır=r, sütun başlangıcı=c  → c <= 7 <= c+4  (c: 3..7)
+        # Dikey:  sütun=c, satır başlangıcı=r → r <= 7 <= r+4  (r: 3..7)
+        altay_positions = []
+        for offset in range(5):          # kelime uzunluğu 5, indis 0..4
+            start = 7 - offset           # ilk harfin koordinatı
+            if 0 <= start and start + 4 <= 14:
+                altay_positions.append(('h', 7, start))   # satır=7, sütun=start
+                altay_positions.append(('v', start, 7))   # satır=start, sütun=7
+        orient, row, col = _random.choice(altay_positions)
+        for i, ch in enumerate("ALTAY"):
+            if orient == 'h':
+                self.board[row][col + i] = ch
+            else:
+                self.board[row + i][col] = ch
 
         self.bonus = deepcopy(self.tahta_puanlari2)
+
+        # 25 puanlık özel hücreyi her episode'da 0 değerli rastgele bir konuma yerleştir
+        zero_cells = list(zip(*np.where(self.bonus == 0)))
+        if zero_cells:
+            ry, rx = _random.choice(zero_cells)
+            self.bonus[ry, rx] = 25
         self.stok = deepcopy(self.init_stok)
 
         # Her iki oyuncuya 7'şer harf dağıt
@@ -241,7 +269,12 @@ class KelimelikDQNEnv(gym.Env):
     
         # --- Raf güncellemesi (hamle yoksa eksilen_biz zaten []) ---
         if eksilen_biz:
-            self.elde = ke.raftan_cikar(self.elde, eksilen_biz)
+            # "JOKER->A" formatındaki girdileri "*" olarak normalize et
+            eksilen_normalize = [
+                "*" if (isinstance(h, str) and h.startswith("JOKER->")) else h
+                for h in eksilen_biz
+            ]
+            self.elde = ke.raftan_cikar(self.elde, eksilen_normalize)
             yeniler_biz, self.stok = ke.harf_dagit(self.stok, len(eksilen_biz))
             self.elde.extend(yeniler_biz)
     
@@ -273,9 +306,13 @@ class KelimelikDQNEnv(gym.Env):
             self.consecutive_passes = 0
             #print(f"🔸  [AJAN 2 DEBUG] Rakip Kelime bulundu | puan={puan_rakip:.1f} ")
             #print("---------------------------------------------")
-    
+
         if eksilen_rakip:
-            self.elde_rakip = ke.raftan_cikar(self.elde_rakip, eksilen_rakip)
+            eksilen_rakip_norm = [
+                "*" if (isinstance(h, str) and h.startswith("JOKER->")) else h
+                for h in eksilen_rakip
+            ]
+            self.elde_rakip = ke.raftan_cikar(self.elde_rakip, eksilen_rakip_norm)
             yeniler_rakip, self.stok = ke.harf_dagit(self.stok, len(eksilen_rakip))
             self.elde_rakip.extend(yeniler_rakip)
     
