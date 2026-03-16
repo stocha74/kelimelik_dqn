@@ -11,6 +11,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import kelimelik_engine1 as ke
 from copy import deepcopy
+import os
+from datetime import datetime
 
 # --- 84 eylem: toplamı 1 olan 4'lü ağırlık vektörleri ---
 def generate_simplex_actions(levels=6):
@@ -34,7 +36,7 @@ def encode_board(board):
     tensor = np.zeros((15, 15, len(HARFLER)), dtype=np.float32)
     for y in range(15):
         for x in range(15):
-            cell = board[y][x]
+            cell = str(board[y][x]).upper() if board[y][x] != "" else ""
             if cell in HARF2ID:
                 tensor[y, x, HARF2ID[cell]] = 1.0
     return tensor
@@ -59,11 +61,17 @@ def encode_bonus_matrix(bonus_mat):
 
 # --- Ortam tanımı ---
 class KelimelikDQNEnv(gym.Env):
-    def __init__(self, sozluk, tahta_puanlari2, harf_stogu):
+    def __init__(self, sozluk, tahta_puanlari2, harf_stogu, debug=False, log_dir="logs", auto_save_excel=True):
         super().__init__()
         self.sozluk = sozluk
         self.tahta_puanlari2 = deepcopy(tahta_puanlari2)
         self.init_stok = deepcopy(harf_stogu)
+        self.debug = debug
+        self.log_dir = log_dir
+        self.auto_save_excel = auto_save_excel
+        self.episode_no = 0
+        self.turn_history = []
+        self.last_log_path = None
 
         # Gözlem alanı
         self.observation_space = spaces.Dict({
@@ -76,13 +84,105 @@ class KelimelikDQNEnv(gym.Env):
         self.action_space = spaces.Discrete(len(actions_84))  # 84 aksiyon
         self.reset()
 
+    def _rastgele_altay_pozisyonu(self):
+        """
+        ALTAY kelimesini her episode'da merkez hücreden (7,7) geçecek şekilde
+        yatay veya dikey rastgele konumlar.
+        """
+        olasi = []
+        # Yatay: satır 7 sabit, başlangıç x = 3..7 -> x=7 kesin içeride
+        for x0 in range(3, 8):
+            olasi.append((x0, 7, "h"))
+        # Dikey: sütun 7 sabit, başlangıç y = 3..7 -> y=7 kesin içeride
+        for y0 in range(3, 8):
+            olasi.append((7, y0, "v"))
+
+        idx = int(self.np_random.integers(0, len(olasi)))
+        return olasi[idx]
+
+    def _altay_yerlestir(self):
+        x0, y0, orient = self._rastgele_altay_pozisyonu()
+        if orient == "h":
+            for i, ch in enumerate("ALTAY"):
+                self.board[y0][x0 + i] = ch
+        else:
+            for i, ch in enumerate("ALTAY"):
+                self.board[y0 + i][x0] = ch
+
+    def _rastgele_25_bonusu_koy(self):
+        """
+        25 puan hücresini her episode'da yeni bir yere taşır.
+        Sadece bonusu 0 olan ve tahta üzerinde harf olmayan bir hücre seçilir.
+        """
+        self.bonus[self.bonus == 25] = 0
+
+        uygun_hucreler = []
+        for y in range(15):
+            for x in range(15):
+                if self.bonus[y, x] == 0 and self.board[y][x] == "":
+                    uygun_hucreler.append((y, x))
+
+        if not uygun_hucreler:
+            return
+
+        idx = int(self.np_random.integers(0, len(uygun_hucreler)))
+        y, x = uygun_hucreler[idx]
+        self.bonus[y, x] = 25
+
+
+    def _log_turn(self, action_id, action_source, weights, puan_biz, puan_rakip, rl_no_move, rakip_no_move):
+        self.turn_history.append({
+            "episode": int(self.episode_no),
+            "turn": int(self.turn),
+            "action_id": int(action_id),
+            "action_source": str(action_source),
+            "agent_type": "policy" if str(action_source).lower() == "policy" else "random",
+            "w_puan": float(weights[0]),
+            "w_harf": float(weights[1]),
+            "w_dez": float(weights[2]),
+            "w_oran": float(weights[3]),
+            "puan_biz": float(puan_biz),
+            "puan_rakip": float(puan_rakip),
+            "kumulatif_biz": float(self.own_score),
+            "kumulatif_rakip": float(self.opp_score),
+            "forced_pass_biz": bool(rl_no_move),
+            "forced_pass_rakip": bool(rakip_no_move)
+        })
+
+    def _save_turn_history_excel(self):
+        if not self.turn_history:
+            return None
+
+        os.makedirs(self.log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        xlsx_path = os.path.join(self.log_dir, f"episode_{self.episode_no:05d}_{ts}.xlsx")
+
+        try:
+            import pandas as pd
+            pd.DataFrame(self.turn_history).to_excel(xlsx_path, index=False)
+            self.last_log_path = xlsx_path
+            return xlsx_path
+        except Exception:
+            csv_path = xlsx_path.replace('.xlsx', '.csv')
+            import csv
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=list(self.turn_history[0].keys()))
+                writer.writeheader()
+                writer.writerows(self.turn_history)
+            self.last_log_path = csv_path
+            return csv_path
+
     def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.episode_no += 1
+        self.turn_history = []
+        self.last_log_path = None
+
         # Boş tahta
         self.board = np.array([["" for _ in range(15)] for _ in range(15)])
-        # Orta kısımda A L T A Y örnek olarak duruyor
-        self.board[7][7:12] = list("ALTAY")
-
         self.bonus = deepcopy(self.tahta_puanlari2)
+        self._altay_yerlestir()
+        self._rastgele_25_bonusu_koy()
         self.stok = deepcopy(self.init_stok)
 
         # Her iki oyuncuya 7'şer harf dağıt
@@ -96,7 +196,8 @@ class KelimelikDQNEnv(gym.Env):
 
         return self._get_obs(), {}
 
-    def step_emektar(self, action_id):
+    def step_emektar(self, action_id, action_source="policy"):
+
         """
         2 ajanlı ortam:
         - RL ajan (biz) action_id ile oynar
@@ -135,12 +236,13 @@ class KelimelikDQNEnv(gym.Env):
     
         # --- DEBUG: kelime bulunamadı mı? ---
         if not ana_dizin_biz or puan_biz == 0:
-            print("⚠️  [DEBUG] RL ajan kelime bulamadı!")
-            print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
+            if self.debug:
+                print("⚠️  [DEBUG] RL ajan kelime bulamadı!")
+                print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
         else:
-            
-            print(f"✅  [DEBUG] Kelime bulundu | puan={puan_biz:.1f} | w={tuple(round(w,2) for w in weights)}")
-            print("---------------------------------------------")
+            if self.debug:
+                print(f"✅  [DEBUG] Kelime bulundu | puan={puan_biz:.1f} | w={tuple(round(w,2) for w in weights)}")
+                print("---------------------------------------------")
     
         # --- Raf güncellemesi ---
         if eksilen_biz:
@@ -159,8 +261,9 @@ class KelimelikDQNEnv(gym.Env):
         )
         #print("Rakip opsiyon sayısı"+str(len(ana_dizin_rakip)))
         
-        print(f"🔸  [DEBUG] Rakip Kelime bulundu | puan={puan_rakip:.1f} ")
-        print("---------------------------------------------")
+        if self.debug:
+            print(f"🔸  [DEBUG] Rakip Kelime bulundu | puan={puan_rakip:.1f} ")
+            print("---------------------------------------------")
     
         if eksilen_rakip:
             self.elde_rakip = ke.raftan_cikar(self.elde_rakip, eksilen_rakip)
@@ -174,6 +277,9 @@ class KelimelikDQNEnv(gym.Env):
     
         self.turn += 1
         done = (self.turn >= 30) or (sum(self.stok.values()) == 0)
+
+        self._log_turn(action_id, action_source, weights, puan_biz, puan_rakip, False, False)
+        log_path = self._save_turn_history_excel() if (done and self.auto_save_excel) else None
     
         # --- 4️⃣ Bilgi döndür ---
         info = {
@@ -182,7 +288,9 @@ class KelimelikDQNEnv(gym.Env):
             "puan_biz": puan_biz,
             "puan_rakip": puan_rakip,
             "agirliklar": weights,
-            "reward_raw": reward_raw
+            "reward_raw": reward_raw,
+            "action_source": action_source,
+            "log_path": log_path
         }
     
         return self._get_obs(), reward, done, False, info
@@ -202,7 +310,8 @@ class KelimelikDQNEnv(gym.Env):
         print("Raf:", self.elde)
         print("Stok:", sum(self.stok.values()))
 
-    def step(self, action_id):
+    def step(self, action_id, action_source="policy"):
+
         import numpy as np
     
         weights = actions_84[action_id]
@@ -232,8 +341,9 @@ class KelimelikDQNEnv(gym.Env):
             ana_dizin_biz = []
     
             self.consecutive_passes = getattr(self, "consecutive_passes", 0) + 1
-            print("⚠️  [DEBUG] RL FORCED PASS (hamle yok)")
-            print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
+            if self.debug:
+                print("⚠️  [DEBUG] RL FORCED PASS (hamle yok)")
+                print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
         else:
             self.consecutive_passes = 0
             #print(f"✅  [AJAN 1 DEBUG] Kelime bulundu | puan={puan_biz:.1f} | w={tuple(round(w,2) for w in weights)}")
@@ -247,7 +357,8 @@ class KelimelikDQNEnv(gym.Env):
     
         self.own_score += puan_biz
         #print("Bizim opsiyon sayısı" + str(len(ana_dizin_biz)))
-        print("---------------------------------------------")
+        if self.debug:
+            print("---------------------------------------------")
     
         # --- 2️⃣ Deterministik rakip oynuyor ---
         elde_rakip_str = ''.join(self.elde_rakip)
@@ -267,8 +378,9 @@ class KelimelikDQNEnv(gym.Env):
             ana_dizin_rakip = []
     
             self.consecutive_passes = getattr(self, "consecutive_passes", 0) + 1
-            print("⚠️  [DEBUG] RAKIP FORCED PASS (hamle yok)")
-            print("---------------------------------------------")
+            if self.debug:
+                print("⚠️  [DEBUG] RAKIP FORCED PASS (hamle yok)")
+                print("---------------------------------------------")
         else:
             self.consecutive_passes = 0
             #print(f"🔸  [AJAN 2 DEBUG] Rakip Kelime bulundu | puan={puan_rakip:.1f} ")
@@ -287,6 +399,9 @@ class KelimelikDQNEnv(gym.Env):
     
         self.turn += 1
         done = (self.turn >= 30) or (sum(self.stok.values()) == 0) or (getattr(self, "consecutive_passes", 0) >= 2)
+
+        self._log_turn(action_id, action_source, weights, puan_biz, puan_rakip, rl_no_move, rakip_no_move)
+        log_path = self._save_turn_history_excel() if (done and self.auto_save_excel) else None
     
         info = {
             "kelime_biz": ana_dizin_biz,
@@ -296,14 +411,17 @@ class KelimelikDQNEnv(gym.Env):
             "agirliklar": weights,
             "reward_raw": reward_raw,
             "forced_pass_biz": rl_no_move,
-            "forced_pass_rakip": rakip_no_move
+            "forced_pass_rakip": rakip_no_move,
+            "action_source": action_source,
+            "log_path": log_path
         }
     
         return self._get_obs(), reward, done, False, info
 
 '''
 
-    def step(self, action_id):
+    def step(self, action_id, action_source="policy"):
+
         """
         2 ajanlı ortam:
         - RL ajan (biz) action_id ile oynar
@@ -371,4 +489,3 @@ class KelimelikDQNEnv(gym.Env):
 
         return self._get_obs(), reward, done, False, info
 '''
-
