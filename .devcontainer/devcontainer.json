@@ -1,7 +1,7 @@
 {
   "name": "Python Data",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
-  "postCreateCommand": "pip install jupyter ipykernel && pip install -r requirements.txt",
+  "postCreateCommand": "pip install tensorflow gymnasium numpy jupyter ipykernel",
   "customizations": {
     "vscode": {
       "extensions": [
