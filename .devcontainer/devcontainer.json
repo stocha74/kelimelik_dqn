@@ -1,0 +1,13 @@
+{
+  "name": "Python Data",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "pip install tensorflow gymnasium numpy jupyter ipykernel",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ]
+    }
+  }
+}

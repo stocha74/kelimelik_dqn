@@ -34,7 +34,7 @@ def encode_board(board):
     tensor = np.zeros((15, 15, len(HARFLER)), dtype=np.float32)
     for y in range(15):
         for x in range(15):
-            cell = board[y][x]
+            cell = str(board[y][x]).upper() if board[y][x] != "" else ""
             if cell in HARF2ID:
                 tensor[y, x, HARF2ID[cell]] = 1.0
     return tensor
@@ -59,11 +59,12 @@ def encode_bonus_matrix(bonus_mat):
 
 # --- Ortam tanımı ---
 class KelimelikDQNEnv(gym.Env):
-    def __init__(self, sozluk, tahta_puanlari2, harf_stogu):
+    def __init__(self, sozluk, tahta_puanlari2, harf_stogu, debug=False):
         super().__init__()
         self.sozluk = sozluk
         self.tahta_puanlari2 = deepcopy(tahta_puanlari2)
         self.init_stok = deepcopy(harf_stogu)
+        self.debug = debug
 
         # Gözlem alanı
         self.observation_space = spaces.Dict({
@@ -76,13 +77,59 @@ class KelimelikDQNEnv(gym.Env):
         self.action_space = spaces.Discrete(len(actions_84))  # 84 aksiyon
         self.reset()
 
+    def _rastgele_altay_pozisyonu(self):
+        """
+        ALTAY kelimesini her episode'da merkez hücreden (7,7) geçecek şekilde
+        yatay veya dikey rastgele konumlar.
+        """
+        olasi = []
+        # Yatay: satır 7 sabit, başlangıç x = 3..7 -> x=7 kesin içeride
+        for x0 in range(3, 8):
+            olasi.append((x0, 7, "h"))
+        # Dikey: sütun 7 sabit, başlangıç y = 3..7 -> y=7 kesin içeride
+        for y0 in range(3, 8):
+            olasi.append((7, y0, "v"))
+
+        idx = int(self.np_random.integers(0, len(olasi)))
+        return olasi[idx]
+
+    def _altay_yerlestir(self):
+        x0, y0, orient = self._rastgele_altay_pozisyonu()
+        if orient == "h":
+            for i, ch in enumerate("ALTAY"):
+                self.board[y0][x0 + i] = ch
+        else:
+            for i, ch in enumerate("ALTAY"):
+                self.board[y0 + i][x0] = ch
+
+    def _rastgele_25_bonusu_koy(self):
+        """
+        25 puan hücresini her episode'da yeni bir yere taşır.
+        Sadece bonusu 0 olan ve tahta üzerinde harf olmayan bir hücre seçilir.
+        """
+        self.bonus[self.bonus == 25] = 0
+
+        uygun_hucreler = []
+        for y in range(15):
+            for x in range(15):
+                if self.bonus[y, x] == 0 and self.board[y][x] == "":
+                    uygun_hucreler.append((y, x))
+
+        if not uygun_hucreler:
+            return
+
+        idx = int(self.np_random.integers(0, len(uygun_hucreler)))
+        y, x = uygun_hucreler[idx]
+        self.bonus[y, x] = 25
+
     def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
         # Boş tahta
         self.board = np.array([["" for _ in range(15)] for _ in range(15)])
-        # Orta kısımda A L T A Y örnek olarak duruyor
-        self.board[7][7:12] = list("ALTAY")
-
         self.bonus = deepcopy(self.tahta_puanlari2)
+        self._altay_yerlestir()
+        self._rastgele_25_bonusu_koy()
         self.stok = deepcopy(self.init_stok)
 
         # Her iki oyuncuya 7'şer harf dağıt
@@ -135,12 +182,13 @@ class KelimelikDQNEnv(gym.Env):
     
         # --- DEBUG: kelime bulunamadı mı? ---
         if not ana_dizin_biz or puan_biz == 0:
-            print("⚠️  [DEBUG] RL ajan kelime bulamadı!")
-            print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
+            if self.debug:
+                print("⚠️  [DEBUG] RL ajan kelime bulamadı!")
+                print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
         else:
-            
-            print(f"✅  [DEBUG] Kelime bulundu | puan={puan_biz:.1f} | w={tuple(round(w,2) for w in weights)}")
-            print("---------------------------------------------")
+            if self.debug:
+                print(f"✅  [DEBUG] Kelime bulundu | puan={puan_biz:.1f} | w={tuple(round(w,2) for w in weights)}")
+                print("---------------------------------------------")
     
         # --- Raf güncellemesi ---
         if eksilen_biz:
@@ -159,8 +207,9 @@ class KelimelikDQNEnv(gym.Env):
         )
         #print("Rakip opsiyon sayısı"+str(len(ana_dizin_rakip)))
         
-        print(f"🔸  [DEBUG] Rakip Kelime bulundu | puan={puan_rakip:.1f} ")
-        print("---------------------------------------------")
+        if self.debug:
+            print(f"🔸  [DEBUG] Rakip Kelime bulundu | puan={puan_rakip:.1f} ")
+            print("---------------------------------------------")
     
         if eksilen_rakip:
             self.elde_rakip = ke.raftan_cikar(self.elde_rakip, eksilen_rakip)
@@ -232,8 +281,9 @@ class KelimelikDQNEnv(gym.Env):
             ana_dizin_biz = []
     
             self.consecutive_passes = getattr(self, "consecutive_passes", 0) + 1
-            print("⚠️  [DEBUG] RL FORCED PASS (hamle yok)")
-            print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
+            if self.debug:
+                print("⚠️  [DEBUG] RL FORCED PASS (hamle yok)")
+                print(f"     Ağırlıklar: w_puan={weights[0]:.2f}, w_harf={weights[1]:.2f}, w_dez={weights[2]:.2f}, w_oran={weights[3]:.2f}")
         else:
             self.consecutive_passes = 0
             #print(f"✅  [AJAN 1 DEBUG] Kelime bulundu | puan={puan_biz:.1f} | w={tuple(round(w,2) for w in weights)}")
@@ -247,7 +297,8 @@ class KelimelikDQNEnv(gym.Env):
     
         self.own_score += puan_biz
         #print("Bizim opsiyon sayısı" + str(len(ana_dizin_biz)))
-        print("---------------------------------------------")
+        if self.debug:
+            print("---------------------------------------------")
     
         # --- 2️⃣ Deterministik rakip oynuyor ---
         elde_rakip_str = ''.join(self.elde_rakip)
@@ -267,8 +318,9 @@ class KelimelikDQNEnv(gym.Env):
             ana_dizin_rakip = []
     
             self.consecutive_passes = getattr(self, "consecutive_passes", 0) + 1
-            print("⚠️  [DEBUG] RAKIP FORCED PASS (hamle yok)")
-            print("---------------------------------------------")
+            if self.debug:
+                print("⚠️  [DEBUG] RAKIP FORCED PASS (hamle yok)")
+                print("---------------------------------------------")
         else:
             self.consecutive_passes = 0
             #print(f"🔸  [AJAN 2 DEBUG] Rakip Kelime bulundu | puan={puan_rakip:.1f} ")
@@ -371,4 +423,3 @@ class KelimelikDQNEnv(gym.Env):
 
         return self._get_obs(), reward, done, False, info
 '''
-
